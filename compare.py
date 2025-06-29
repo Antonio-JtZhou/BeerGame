@@ -7,7 +7,6 @@ import random
 from collections import deque
 import os
 
-# 复制环境类
 class Env:
     def __init__(self, num_firms, p, h, c, initial_inventory, poisson_lambda=10, max_steps=100):
         """
@@ -211,6 +210,7 @@ class DQNAgent:
         self.tau = tau
         self.update_every = update_every
         self.learning_step = 0
+        self.q_value_history = []
         
         # 创建Q网络和目标网络
         self.q_network = QNetwork(state_size, action_size)
@@ -292,6 +292,7 @@ class DQNAgent:
         
         # 获取当前Q值估计
         Q_expected = self.q_network(states).gather(1, actions)
+        self.q_value_history.append(Q_expected.mean().item())
         
         # 计算损失
         loss = nn.MSELoss()(Q_expected, Q_targets)
@@ -481,138 +482,179 @@ def test_agent(env, agent, num_episodes=10):
     
     return scores, inventory_history, orders_history, demand_history, satisfied_demand_history
 
-def plot_training_results(scores, window_size=100):
-    """
-    绘制训练结果
-    
-    :param scores: 每个episode的奖励
-    :param window_size: 移动平均窗口大小
-    """
-    # 计算移动平均
-    def moving_average(data, window_size):
-        return [np.mean(data[max(0, i-window_size):i+1]) for i in range(len(data))]
-    
-    avg_scores = moving_average(scores, window_size)
-    
-    plt.figure(figsize=(10, 6))
-    plt.plot(np.arange(len(scores)), scores, alpha=0.3, label='Init Reward')
-    plt.plot(np.arange(len(avg_scores)), avg_scores, label=f'Moving Average ({window_size} episodes)')
-    plt.title('DQN Training Process Rewards')
-    plt.xlabel('Episode')
-    plt.ylabel('Total reward')
-    plt.legend()
-    plt.savefig('figures/training_rewards.png')
-    plt.close()
+class DoubleDQNAgent:
+    def __init__(self, state_size, action_size, firm_id, max_order=20, buffer_size=10000, batch_size=64, 
+                 gamma=0.99, learning_rate=1e-3, tau=1e-3, update_every=4):
 
-def plot_test_results(scores, inventory_history, orders_history, demand_history, satisfied_demand_history):
-    """
-    绘制测试结果
+        self.state_size = state_size
+        self.action_size = action_size
+        self.firm_id = firm_id
+        self.max_order = max_order
+        self.batch_size = batch_size
+        self.gamma = gamma
+        self.tau = tau
+        self.update_every = update_every
+        self.learning_step = 0
+        self.q_value_history = []
+
+        self.q_network = QNetwork(state_size, action_size)
+        self.target_network = QNetwork(state_size, action_size)
+        self.target_network.load_state_dict(self.q_network.state_dict())
+
+        self.optimizer = optim.Adam(self.q_network.parameters(), lr=learning_rate)
+        self.memory = ReplayBuffer(buffer_size)
+
+        self.t_step = 0
+
+    def step(self, state, action, reward, next_state, done):
+        self.memory.add(state, action, reward, next_state, done)
+
+        self.t_step = (self.t_step + 1) % self.update_every
+        if self.t_step == 0 and len(self.memory) > self.batch_size:
+            experiences = self.memory.sample(self.batch_size)
+            self.learn(experiences)
+
+    def act(self, state, epsilon=0.0):
+        state = torch.from_numpy(state.flatten()).float().unsqueeze(0)
+        self.q_network.eval()
+        with torch.no_grad():
+            action_values = self.q_network(state)
+        self.q_network.train()
+
+        if random.random() > epsilon:
+            return np.argmax(action_values.cpu().data.numpy()) + 1
+        else:
+            return random.randint(1, self.max_order)
+
+    def learn(self, experiences):
+        states, actions, rewards, next_states, dones = zip(*experiences)
+
+        states = torch.from_numpy(np.vstack([s.flatten() for s in states])).float()
+        actions = torch.from_numpy(np.vstack([a-1 for a in actions])).long()
+        rewards = torch.from_numpy(np.vstack(rewards)).float()
+        next_states = torch.from_numpy(np.vstack([ns.flatten() for ns in next_states])).float()
+        dones = torch.from_numpy(np.vstack(dones).astype(np.uint8)).float()
+
+        # Double DQN核心
+        next_actions = self.q_network(next_states).detach().argmax(1).unsqueeze(1)
+        Q_targets_next = self.target_network(next_states).gather(1, next_actions)
+
+        Q_targets = rewards + (self.gamma * Q_targets_next * (1 - dones))
+        Q_expected = self.q_network(states).gather(1, actions)
+        self.q_value_history.append(Q_expected.mean().item())
+
+        loss = nn.MSELoss()(Q_expected, Q_targets)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        self.learning_step += 1
+        if self.learning_step % self.update_every == 0:
+            self.soft_update()
+
+        return loss.item()
+
+    def soft_update(self):
+        for target_param, local_param in zip(self.target_network.parameters(), self.q_network.parameters()):
+            target_param.data.copy_(self.tau * local_param.data + (1.0 - self.tau) * target_param.data)
+
+    def save(self, filename):
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        torch.save({
+            'q_network_state_dict': self.q_network.state_dict(),
+            'target_network_state_dict': self.target_network.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+        }, filename)
+        print(f"模型已保存到 {filename}")
+
+    def load(self, filename):
+        if os.path.isfile(filename):
+            checkpoint = torch.load(filename)
+            self.q_network.load_state_dict(checkpoint['q_network_state_dict'])
+            self.target_network.load_state_dict(checkpoint['target_network_state_dict'])
+            self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            print(f"从 {filename} 加载了模型")
+            return True
+        return False
     
-    :param scores: 每个episode的奖励
-    :param inventory_history: 每个episode的库存历史
-    :param orders_history: 每个episode的订单历史
-    :param demand_history: 每个episode的需求历史
-    :param satisfied_demand_history: 每个episode的满足需求历史
-    """
-    # 计算平均值，用于绘图
-    avg_inventory = np.mean(inventory_history, axis=0)
-    avg_orders = np.mean(orders_history, axis=0)
-    avg_demand = np.mean(demand_history, axis=0)
-    avg_satisfied_demand = np.mean(satisfied_demand_history, axis=0)
-    
-    # 创建图表
-    fig, axs = plt.subplots(2, 2, figsize=(14, 10))
-    
-    # 库存图表
-    # axs[0, 0].plot(avg_inventory)
-    # axs[0, 0].set_title('平均库存')
-    # axs[0, 0].set_xlabel('时间步')
-    # axs[0, 0].set_ylabel('库存量')
-    
-    # # 订单图表
-    # axs[0, 1].plot(avg_orders)
-    # axs[0, 1].set_title('平均订单量')
-    # axs[0, 1].set_xlabel('时间步')
-    # axs[0, 1].set_ylabel('订单量')
-    
-    # # 需求和满足需求图表
-    # axs[1, 0].plot(avg_demand, label='需求')
-    # axs[1, 0].plot(avg_satisfied_demand, label='满足的需求')
-    # axs[1, 0].set_title('平均需求 vs 满足的需求')
-    # axs[1, 0].set_xlabel('时间步')
-    # axs[1, 0].set_ylabel('数量')
-    # axs[1, 0].legend()
-    
-    # # 奖励柱状图
-    # axs[1, 1].bar(range(len(scores)), scores)
-    # axs[1, 1].set_title('测试episode奖励')
-    # axs[1, 1].set_xlabel('Episode')
-    # axs[1, 1].set_ylabel('总奖励')
-        # 库存图表
-    axs[0, 0].plot(avg_inventory)
-    axs[0, 0].set_title('Average Inventory')
-    axs[0, 0].set_xlabel('Time Step')
-    axs[0, 0].set_ylabel('Inventory Level')
-    
-    # 订单图表
-    axs[0, 1].plot(avg_orders)
-    axs[0, 1].set_title('Average Order Quantity')
-    axs[0, 1].set_xlabel('Time Step')
-    axs[0, 1].set_ylabel('Order Quantity')
-    
-    # 需求和满足需求图表
-    axs[1, 0].plot(avg_demand, label='Demand')
-    axs[1, 0].plot(avg_satisfied_demand, label='Satisfied Demand')
-    axs[1, 0].set_title('Demand vs Satisfied Demand')
-    axs[1, 0].set_xlabel('Time Step')
-    axs[1, 0].set_ylabel('Quantity')
-    axs[1, 0].legend()
-    
-    # 奖励柱状图
-    axs[1, 1].bar(range(len(scores)), scores)
-    axs[1, 1].set_title('Test Episode Rewards')
-    axs[1, 1].set_xlabel('Episode')
-    axs[1, 1].set_ylabel('Total Reward')
-    
-    plt.tight_layout()
-    plt.savefig('figures/test_results.png')
-    plt.close()
+
+def moving_average(data, window_size=100):
+    return [np.mean(data[max(0, i-window_size):i+1]) for i in range(len(data))]
+
+def train_and_evaluate(agent_class, env, firm_id, num_episodes=2000, max_t=100):
+    # 创建agent
+    state_size = 3
+    action_size = 20
+    agent = agent_class(state_size, action_size, firm_id=firm_id, max_order=action_size)
+    # 训练
+    scores = train_dqn(env, agent, num_episodes=num_episodes, max_t=max_t)
+    # 测试
+    test_scores, *_ = test_agent(env, agent, num_episodes=10)
+    return scores, test_scores, agent
+
+def plot_q_value_comparison(dqn_agent, double_dqn_agent):
+    plt.figure(figsize=(12,6))
+
+    plt.plot(dqn_agent.q_value_history, label='DQN Q-Value')
+    plt.plot(double_dqn_agent.q_value_history, label='DoubleDQN Q-Value')
+    plt.xlabel('Training Step')
+    plt.ylabel('Q Value')
+    plt.title('Q-Value Estimation Comparison')
+    plt.legend()
+    plt.grid()
+    plt.savefig('figures/q_value_comparison.png')
+    plt.show()
+
+    # 计算统计信息
+    dqn_std = np.std(dqn_agent.q_value_history)
+    double_dqn_std = np.std(double_dqn_agent.q_value_history)
+    print(f'Q Value Std - DQN: {dqn_std:.4f}, DoubleDQN: {double_dqn_std:.4f}')
+
+    dqn_mean = np.mean(dqn_agent.q_value_history)
+    double_dqn_mean = np.mean(double_dqn_agent.q_value_history)
+    print(f'Q Value Mean - DQN: {dqn_mean:.4f}, DoubleDQN: {double_dqn_mean:.4f}')
+
 
 if __name__ == "__main__":
-    # 创建保存模型和图表的目录
-    os.makedirs('models', exist_ok=True)
-    os.makedirs('figures', exist_ok=True)
-    
-    # 初始化环境参数
-    num_firms = 3  # 假设有3个企业
-    p = [10, 9, 8]  # 价格列表
-    h = 0.5  # 库存持有成本
-    c = 2  # 损失销售成本
-    initial_inventory = 100  # 初始库存
-    poisson_lambda = 10  # 泊松分布的均值
-    max_steps = 100  # 每个episode的最大步数
-    
-    # 创建仿真环境
+    # 环境初始化，与你之前代码一致
+    num_firms = 3
+    p = [10, 9, 8]
+    h = 0.5
+    c = 2
+    initial_inventory = 100
+    poisson_lambda = 10
+    max_steps = 100
     env = Env(num_firms, p, h, c, initial_inventory, poisson_lambda, max_steps)
-    
-    # 为第二个企业创建DQN智能体
-    firm_id = 1  # 选择第二个企业进行训练
-    state_size = 3  # 每个企业的状态维度：订单、满足的需求和库存
-    action_size = 20  # 假设最大订单量为20
-    
-    agent = DQNAgent(state_size=state_size, action_size=action_size, firm_id=firm_id, max_order=action_size)
-    
-    # 训练DQN智能体
-    scores = train_dqn(env, agent, num_episodes=2000, max_t=max_steps, eps_start=1.0, eps_end=0.01, eps_decay=0.995)
-    
-    plt.rcParams['font.sans-serif'] = ['DejaVu Sans Mono']  # 指定中文字体
-    plt.rcParams['axes.unicode_minus'] = False  # 绘图显示负号
 
-    # 绘制训练结果
-    plot_training_results(scores)
+    firm_id = 1  # 训练第2个企业
+
+    # 训练DQN
+    print("Training DQN...")
+    dqn_train_scores, dqn_test_scores, dqn = train_and_evaluate(DQNAgent, env, firm_id, num_episodes=1000, max_t=max_steps)
+
+    # 训练DoubleDQN
+    print("Training DoubleDQN...")
+    double_dqn_train_scores, double_dqn_test_scores, doubledqn = train_and_evaluate(DoubleDQNAgent, env, firm_id, num_episodes=1000, max_t=max_steps)
+
+    # 计算移动平均
+    dqn_avg = moving_average(dqn_train_scores)
+    double_dqn_avg = moving_average(double_dqn_train_scores)
+
+    # 绘制训练曲线
+    plt.figure(figsize=(12,6))
+    plt.plot(dqn_avg, label="DQN Train Reward (Moving Avg)")
+    plt.plot(double_dqn_avg, label="DoubleDQN Train Reward (Moving Avg)")
+    plt.xlabel("Episode")
+    plt.ylabel("Reward")
+    plt.title("Training Reward Comparison")
+    plt.legend()
+    plt.grid()
+    plt.savefig('figures/train_reward_comparison.png')
+    plt.show()
     
-    # 测试训练好的智能体
-    test_scores, inventory_history, orders_history, demand_history, satisfied_demand_history = test_agent(env, agent, num_episodes=10)
+    plot_q_value_comparison(dqn,doubledqn)
+
     
-    # 绘制测试结果
-    plot_test_results(test_scores, inventory_history, orders_history, demand_history, satisfied_demand_history)
+    # 打印测试阶段平均奖励对比
+    print(f"DQN Test Average Reward: {np.mean(dqn_test_scores):.2f}")
+    print(f"DoubleDQN Test Average Reward: {np.mean(double_dqn_test_scores):.2f}")
