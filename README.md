@@ -5,10 +5,15 @@ This repository provides a Deep Q-Network (DQN) and Double DQN implementation fo
 ## 📂 Project Structure
 
 ├── figures/ # Saved training figures and visualizations
+
 ├── models/ # Saved trained models
+
 ├── README.md # Project documentation
+
 ├── compare.py # Script to compare DQN and Double DQN performance
+
 ├── course_dqn_example.py # DQN training script
+
 ├── course_double_dqn.py # Double DQN training script
 
 
